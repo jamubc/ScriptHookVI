@@ -6,6 +6,8 @@ ScriptHookVI is a library loaded into the game's process that runs custom script
 
 This repository holds the engine only. It contains no data about any game: no addresses, no native function names and no build tables. As published it can be injected into a process and run scripts there, but it cannot call the game's native functions. It ships with a preview mode that needs no other software.
 
+Documentation: https://docs.page/jamubc/ScriptHookVI
+
 For ScriptHookVI in use, see [Native Trainer VI](https://github.com/jamubc/NativeTrainerVI), a trainer menu written for it.
 
 ## What is in this repository
@@ -45,7 +47,7 @@ Success: the terminal shows `ScriptHookVI: loaded example.lua` and the path of t
 
 ## Documentation
 
-The pages in `docs/` cover [installing and running](docs/getting-started.mdx), [scripts](docs/scripts.mdx), [menus](docs/menus.mdx), [drawing](docs/drawing.mdx), [memory](docs/memory.mdx) and the [Lua API](docs/lua-api.mdx).
+The docs site is https://docs.page/jamubc/ScriptHookVI, served from `docs.json` and the `docs/` folder. It covers [installing and running](https://docs.page/jamubc/ScriptHookVI/getting-started), [scripts](https://docs.page/jamubc/ScriptHookVI/scripts), [menus](https://docs.page/jamubc/ScriptHookVI/menus), [drawing](https://docs.page/jamubc/ScriptHookVI/drawing), [memory](https://docs.page/jamubc/ScriptHookVI/memory) and the [Lua API](https://docs.page/jamubc/ScriptHookVI/lua-api).
 
 ## Legal
 
