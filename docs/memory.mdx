@@ -1,0 +1,231 @@
+---
+title: Memory
+description: Read and write process memory, scan for byte patterns, name addresses with signatures, follow pointer chains, describe structs, keep offsets per build, and call code in the process.
+---
+
+Addresses are plain Lua integers. The memory calls on this page work the same in every mode: the injected engine reads the process it is injected into, the external engine reads the attached process through a process handle, and detached or in the preview the engine reads its own process. Calls into code are the exception; see [Calling code](#calling-code).
+
+## The title image
+
+"The title image" in these docs means the executable image the engine picks in the target process, as described below. Offsets in this documentation are relative to its base.
+
+| Call | Returns |
+| --- | --- |
+| `mem.base()` | Base address of the title image. |
+| `mem.size()` | Its size in bytes, as the module list or its PE header gives it. |
+| `mem.found()` | `true` once the title image is located. Before the first image is found, `base` and `size` describe the main executable of the process being read; after `scripthookvi.rescan()` they keep the old image until a new one is found. |
+| `mem.rva(offset)` | `mem.base() + offset`. |
+| `mem.set_base(addr)` | Use the image at `addr` instead of the one found, with its size from its PE header, and count it as found. |
+| `scripthookvi.rescan()` | Forget the image found and look again. |
+
+The engine looks for the largest module of at least 64 MB other than the process's main executable. When no such module is listed, it walks the process memory for the largest PE image of at least 64 MB instead. It looks again every two seconds until it finds one (the external engine walks the memory only once per attach, and again after `scripthookvi.rescan()`), and logs `title image at 0x<base>, 0x<size> bytes`, with both numbers in hex.
+
+## Reading and writing
+
+```lua title="scripts/50_read.lua"
+local base = mem.base()
+log("title image", mem.found() and "found" or "not found", string.format("%x", base), mem.size())
+
+local pe = mem.read(base + 0x3C, "u32")
+local machine = pe and mem.read(base + pe + 4, "u16")
+log("PE header at", pe and string.format("%x", base + pe), "machine", machine and string.format("%x", machine))
+```
+
+| Call | Returns |
+| --- | --- |
+| `mem.read(addr, type)` | The value, or `nil` when the memory is not readable. |
+| `mem.write(addr, type, value)` | `true` when written. `value` is a number or a boolean. When the page is read-only the engine makes it writable for the write and restores its protection afterwards. |
+| `mem.bytes(addr, n)` | `n` raw bytes (at most 64 MB) as a Lua string, or `nil`. |
+| `mem.poke(addr, str)` | Writes the bytes of `str`; `true` when written. |
+| `mem.string(addr [, max])` | The bytes up to the first zero byte, at most `max` (default 256, at most 65536). Unreadable memory gives a shorter or empty string. |
+
+Types: `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64` and `ptr` (8 bytes). Integer types come back as Lua integers, and floats as Lua floats. A `u64` or `ptr` above `0x7fffffffffffffff` comes back negative, because Lua integers are signed 64-bit.
+
+## Structs
+
+`mem.struct(addr, layout)` returns a table whose fields read and write memory. Each field is `{ offset, type }`, or `{ offset, layout }` for a nested struct. `.addr` gives the address back.
+
+```lua title="scripts/50_struct.lua"
+local buf = mem.alloc(64)
+
+local pos = mem.struct(buf, {
+  x = { 0x0, "f32" },
+  y = { 0x4, "f32" },
+  z = { 0x8, "f32" },
+  flags = { 0x10, "u32" },
+  inner = { 0x20, { count = { 0x0, "i32" } } },
+})
+
+pos.x, pos.y, pos.z = 1.5, -2, 30
+pos.inner.count = 7
+log(pos.x, pos.y, pos.z, pos.inner.count, string.format("%x", pos.addr))
+```
+
+Reading a field not in the layout gives `nil`; writing one raises `no field <name>`. Every access reads or writes memory; nothing is cached.
+
+## Byte patterns
+
+`mem.scan(pattern [, start, len, limit])` returns a list of addresses where the pattern matches. The pattern is hex bytes separated by spaces; `?` or `??` matches any byte. By default it searches `mem.size()` bytes from `mem.base()` and stops at the **first** hit; pass `limit` for more. A malformed pattern raises `bad pattern`.
+
+Code that loads a global usually does it RIP-relative: the instruction holds a 32-bit displacement from the end of the instruction. To turn a hit into the address it refers to:
+
+```lua title="scripts/50_scan.lua"
+local function rip(at, disp, len)
+  local rel = mem.read(at + disp, "i32")
+  return rel and at + len + rel
+end
+
+local hit = mem.scan("48 8B 05 ?? ?? ?? ?? 48 85 C0 C3")[1]
+if hit then
+  log("mov rax, [rip+...] at", string.format("%x", hit), "loads from", string.format("%x", rip(hit, 3, 7)))
+end
+
+local hits = mem.scan("48 8B 05 ?? ?? ?? ?? 48 85 C0 C3", mem.base(), mem.size(), 16)
+log(#hits, "hits, at most 16")
+```
+
+The pattern is an example of a generic x86-64 instruction shape (`mov rax, [rip+...]`, `test rax, rax`, `ret`), not taken from any program. It can match nowhere or in many places.
+
+A pattern survives a new build better than a raw offset, but only when it is unique. Check that it has exactly one hit in the image before relying on it; [Signatures](#signatures) does that check for you and keeps the result.
+
+## Signatures
+
+A signature names an address that scripts find by byte pattern instead of a fixed offset.
+
+```lua
+sig.define("my_global", { pattern = "48 8B 05 ?? ?? ?? ?? 48 85 C0 C3", offset = 3, rip = true, deref = 0, add = 0, section = ".text" })
+
+local addr, why = sig.get("my_global")
+```
+
+The name and pattern are the made-up example from [Byte patterns](#byte-patterns). When the pattern matches once, `addr` is the address the instruction loads from.
+
+| Call | Does |
+| --- | --- |
+| `sig.define(name, def)` | Records a copy of `def`: `pattern` (hex bytes and `??`), and the optional `offset`, `rip`, `deref`, `add` and `section`. `offset`, `deref` and `add` are whole numbers, `deref` not negative. Names are printable ASCII without spaces or `=`. A bad name, pattern, number or section raises an error. Defining a name again replaces it. Nothing is searched yet. |
+| `sig.get(name)` | The address, or `nil, reason`. |
+| `sig.all()` | Every name in the order defined, as `{ name, pattern, state, addr, rva, reason, from, scans }`: `state` is `"pending"`, `"found"` or `"failed"`, `rva` is the address minus the image base, `from` is `"cache"` or `"scan"`, and `scans` counts the searches since the scripts loaded. |
+| `sig.rescan()` | Forgets every result and what is kept in the settings for this build, so the next `sig.get` of each name searches again. |
+
+The first `sig.get` of a name searches the title image, or only the named PE section, with `mem.scan`. One match gives the address: the match plus `offset`, then with `rip` the 32-bit displacement there is followed (the address after the displacement plus the displacement), then `deref` pointers are read one after another, then `add` is added. The search result, one match or a failed search, stays until `sig.rescan()`, a new `sig.define` of the name, or a title image at another base. When the match was found but following it failed (`unreadable` or `null pointer`), each later `sig.get` follows it again without searching.
+
+| Reason | Meaning |
+| --- | --- |
+| `not defined` | No `sig.define` for that name. |
+| `no title` | No title image is found yet. |
+| `no section <name>` | The image has no section of that name. |
+| `not found` | The pattern does not match. |
+| `2 matches` up to `15 matches`, `16 or more matches` | The pattern is not unique. |
+| `unreadable` | The displacement or a pointer on the way cannot be read. |
+| `null pointer` | A pointer on the way is zero. |
+
+A single match is kept in the settings as its offset from the image base, under `sig.<link stamp>:<image size>.<name>`, for example `sig.12345678:4000000.my_global`, where the stamp and size are made up. When the scripts load again, the first `sig.get` checks that the pattern still matches at that offset, which reads only the pattern's bytes, and searches the image again only when it does not. Failed searches are not kept. In the preview and with `--run` the settings stay in memory, so nothing is kept across starts. See [The settings store](/scripts#the-settings-store).
+
+A search runs inside the `sig.get` that needs it, so the tick or script load that calls it is late by as long as the search takes. A `section` narrows the search.
+
+## Pointer chains
+
+`mem.deref(addr, off1, off2, ...)` reads a pointer at `addr` and adds `off1`, reads a pointer there and adds `off2`, and so on. It returns the final **address**, not the value there, or `nil` when a pointer on the way is unreadable or zero.
+
+```lua title="scripts/50_chain.lua"
+local a, b = mem.alloc(16), mem.alloc(16)
+mem.write(a + 8, "ptr", b)
+mem.write(b + 4, "i32", 42)
+
+local addr = mem.deref(a + 8, 4)
+log("chain ends at", string.format("%x", addr), "value", mem.read(addr, "i32"))
+```
+
+`mem.deref(x, 4)` is `mem.read(x, "ptr") + 4` when that pointer is readable and not zero, and `nil` otherwise.
+
+## Builds and offsets
+
+Offsets change between builds of an image, so scripts keep them per build. A build is told apart by the link time stamp in the title image's PE header together with the image size.
+
+| Name | Defined in | Meaning |
+| --- | --- | --- |
+| `game.stamp()` | engine | The title image's link time stamp, or `nil` when it is not found. |
+| `scripthookvi.builds` | prelude, empty until a script fills it | Maps `"<stamp>:<size>"` (stamp as 8 hex digits, size in hex) to a build name. |
+| `game.build()` | prelude | The build name, `"unknown"` for a title image with no entry, or `nil` when no title image is found. |
+| `scripthookvi.offsets` | prelude, empty until a script fills it | Maps a build name to a table of named offsets from the image base. |
+| `game.at(name)` | prelude | `mem.rva(scripthookvi.offsets[game.build()][name])`, or `nil` when the build or the name is unknown. |
+
+No file in the repository fills these tables. A script fills them for an image it knows. The key, build name and offset here are made-up examples:
+
+```lua title="scripts/user/10_offsets.lua"
+scripthookvi.builds["12345678:4000000"] = "my build"
+scripthookvi.offsets["my build"] = { frame_update = 0x12340 }
+```
+
+To see the key for the build that is running, read it from the engine:
+
+```lua title="scripts/user/50_build_key.lua"
+local stamp = game.stamp()
+if stamp then
+  log("build key", string.format("%08x:%x", stamp, mem.size()), "is", game.build())
+else
+  log("no title image found:", game.status())
+end
+```
+
+Use offsets through `game.at`, and check for `nil`, so a script does nothing on a build it does not know:
+
+```lua title="scripts/user/50_frame.lua"
+local at = game.at("frame_update")
+if at then
+  log("frame_update at", string.format("%x", at), "first byte", string.format("%02x", mem.read(at, "u8")))
+else
+  log("no frame_update offset for", game.status())
+end
+```
+
+## Calling code
+
+| Call | Meaning |
+| --- | --- |
+| `game.call(addr, ...)` | Calls the function at `addr` with up to 32 arguments (integers, booleans or `nil`, passed as 64-bit integers in the Windows x64 convention) and returns `rax` as an integer, or `nil, "fault <code> at <address>"` when the call faults. A float argument raises an error; use `game.fn` for floats. There is no check that `addr` is executable: a call to an address that is not comes back as a fault. |
+| `game.fn(addr, signature)` | A Lua function that calls `addr` with the argument and return types in `signature`, such as `"f32(ptr, f32, i32)"`. See [Typed calls](#typed-calls). |
+
+`game.call` and the functions `game.fn` builds call into the target process only in the injected engine. Attached from the external engine, they raise the error `calls need the injected engine; this one is external`. Detached and in the preview, they call into the engine's own process. A call runs on the thread the scripts are ticking on: the process's own thread through the tick detour while `hook.ticking()` is true, the engine's own thread otherwise.
+
+In the injected engine the tick moves onto the process's own thread by itself: once the title image is found on a build with a `frame_update` offset, the prelude calls `hook.tick(game.at("frame_update"))` once and the engine logs `engine tick runs on the game thread via a detour at <address>`, unless the setting `engine.game_thread` is `false`. `game.on_thread(fn)` runs `fn` at once and returns its results while `hook.ticking()` is true, and otherwise queues it for the next tick that is and returns nothing; an error in a queued function is logged as `game.on_thread: <error>`. See [Lua API](/lua-api).
+
+### Typed calls
+
+```lua title="scripts/user/50_call.lua"
+local at = game.at("my_function")
+if at and game.mode() == "internal" then
+  local f = game.fn(at, "f64(i32, f32, i64, f64)")
+  log("my_function returns", f(1, 2.0, 3, 4.0))
+end
+```
+
+`my_function` is a made-up name. Until a script adds it to `scripthookvi.offsets` for the running build, `game.at` returns `nil` and nothing is called.
+
+The signature is a return type and a list of argument types in parentheses: `i8 u8 i16 u16 i32 u32 i64 u64 ptr bool f32 f64`, and `void` as the return type only. A malformed signature, one with more than 32 arguments, or one with `void` as an argument raises `bad signature "<signature>"`. Arguments follow the Windows x64 convention: the first four go in `rcx rdx r8 r9` or `xmm0` to `xmm3` by position, the rest on the stack above 32 bytes of shadow space, 16-byte aligned. Integer arguments take integers, booleans (1 and 0) or `nil` (0); float arguments take any number. The return value is cut to its type's width, `bool` reads `al`, `f32` and `f64` read `xmm0`, and `void` returns `true`. A struct of more than 8 bytes returned by value is a hidden first `ptr` argument to a buffer from `mem.alloc`. A wrong argument count or type is a Lua error.
+
+### Faults
+
+A hardware exception inside the call (access violation, illegal instruction, divide by zero, breakpoint, misaligned data, guard page), including a call to an address that is not executable or into the middle of a function, returns `nil, "fault <code> at <address>"` (`fault 0xC0000005 at ...` for an access violation) with the exception code and the address of the faulting instruction, and the process keeps running. This holds for `game.call` and for functions from `game.fn`.
+
+Two handlers do this. The call bridge has its own structured exception handler, like a `__try`/`__except` around the call in C: handlers inside the called code run first, then the stack is unwound to the bridge, running the callee's `__finally` blocks and destructors on the way. A vectored handler, which acts only while a call runs on its thread, first walks the stack from the fault; when the walk does not lead back to the bridge (a wrong address, code without unwind data, a callee that changed `rbp`, or a stack overflow), it resumes the bridge directly instead. Either way the bridge restores every callee-saved register, MXCSR and the x87 control word from its own frame. The bridge always reserves stack room for 32 arguments, so a callee declared with fewer arguments than it takes writes into that room and not into the bridge's frame. Each thread keeps its own active call, and a nested call links to the one it interrupts, so a fault goes back to its own bridge.
+
+What it cannot undo:
+
+- Memory the callee wrote before it faulted stays written.
+- A lock the callee held without a `__finally` block or destructor to release it stays held; on the direct path nothing of the callee runs.
+- A callee that overwrote the bridge's frame or moved its stack pointer off the stack still ends the process.
+- A stack overflow is resumed at the bridge directly, and nothing restores the thread's stack guard page afterwards.
+- A C++ or other software exception that the called code does not handle comes back the same way through the bridge's handler; one raised where the stack cannot be walked still ends the process, since the vectored handler takes only hardware exceptions.
+
+## Safety
+
+<Error>
+  Writing the wrong bytes, or calling a function with the wrong address or arguments, can corrupt or crash the target process. `game.call` and `game.fn` catch hardware faults inside the call, but memory the callee wrote before it faulted stays written, and a wrong address or wrong arguments can still corrupt the process.
+</Error>
+
+- Reads are safe: unreadable memory gives `nil`, never a crash. Test reads before writes.
+- Try writes on memory you own first. `mem.alloc(n)` returns zeroed memory that is never freed; in the external engine it is allocated inside the target process.
+- Gate every write on the build: use `game.at` and check for `nil`, so a script on an unknown build writes nothing instead of writing to a wrong address.
+- `mem.write` and `mem.poke` are never gated: a script that writes, writes.
+- Each load of the scripts allocates 65536 bytes with `mem.alloc` for the prelude's scratch buffer and never frees it. In the external engine that memory is in the target process.

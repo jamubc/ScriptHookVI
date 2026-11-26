@@ -1,0 +1,172 @@
+---
+title: Menus
+description: Build menus with the prelude's menu library, and make items that read and change process memory.
+---
+
+The menu library lives in `src/prelude.lua`. It draws a menu, reads the menu keys, and calls your functions when the user selects or changes an item. Nothing is drawn and F4 shows nothing until a script calls `menu.new`.
+
+## A worked example
+
+The shipped script `examples/scripts/example.lua` builds a complete menu on its own, with no other script loaded. Render it with `SCRIPTS=examples/scripts ./preview.sh out.png` from the repository folder (a relative `SCRIPTS` path is read from the repository folder; the preview opens the menu for you), or put it in an engine's scripts folder and press F4.
+
+```lua title="examples/scripts/example.lua"
+local m = menu.new("Example")
+
+local greetings = 0
+m:action("Say hello", function()
+  greetings = greetings + 1
+  log("hello number", greetings)
+end, "Writes a line to the log each time you select it.")
+
+m:toggle("Show the clock", config.get("example.clock", false), function(on)
+  config.set("example.clock", on)
+end, "Kept in the settings store, so it survives reloads.")
+
+local speed = m:number("Speed", 5, 1, function(v) log("speed is now", v) end, "Left and right change it by one.")
+speed.min, speed.max, speed.format = 0, 10, function(v) return v .. " m/s" end
+
+m:choice("Colour", { "Red", "Green", "Blue" }, 1, function(index, name)
+  log("picked", index, name)
+end, "Left and right step through the list.")
+
+m:label(function() return "Engine", game.mode() end, "A label with a live value on the right.")
+
+local locked = m:action("Call the game", function() end, "Needs the injected engine.")
+locked.unavailable = function()
+  if game.mode() ~= "internal" then return "needs the injected engine" end
+end
+
+local more = m:submenu("More", "A nested menu with a side panel.")
+more:label("Rows here are read-only text.")
+more:action("Back to the top", function() menu.stack = {} end)
+more.on_open = function(sub) log("opened", sub.title) end
+more.side = {
+  width = 420,
+  title = "Panel",
+  info = function() return string.format("%.0f s", now() / 1000) end,
+  draw = function(x, y, w, style)
+    local h = style.row * 2
+    ui.rect(x, y, w, h, style.row_bg)
+    ui.text(x + style.pad, style.mid(y, h, style.size), "Drawn by more.side.draw", 0xFFFFFFFF, style.size)
+  end,
+}
+
+on_frame(function()
+  if not config.get("example.clock", false) then return end
+  ui.text(ui.width() - 20, 20, os.date("%H:%M:%S"), 0xFFFFFFFF, 24, "bold", { align = "right" })
+end)
+```
+
+The first `menu.new` call in a Lua state becomes `menu.root`, the menu that F4 opens. Later `menu.new` calls make free-standing menus. Show one with `menu.enter(m)` from an item of the open menu, or set `menu.open = true` first; F4 starts again from `menu.root`.
+
+## Item kinds
+
+Every method adds an item to the end of the menu and returns it, except `submenu`, which returns the new menu. The last argument of each is an optional description, shown in a box under the menu while the item is selected.
+
+| Method | Row shows | On select or left/right |
+| --- | --- | --- |
+| `m:action(label, fn, desc)` | The label. | Select calls `fn()`. |
+| `m:toggle(label, value, fn, desc)` | A check box. | Select flips `item.value` and calls `fn(value)`. |
+| `m:number(label, value, step, fn, desc)` | `‹ value ›`. | Left and right add or subtract `step` (default 1), keep the value within `min` and `max`, and call `fn(value)` when it changed. |
+| `m:choice(label, options, index, fn, desc)` | `‹ option ›`. | Left and right step through `options`, wrapping at both ends, and call `fn(index, option)`. |
+| `m:text(label, value, fn, desc)` | The label and the string `value` on the right. | Select opens an entry line under the menu, starting from `value`; Enter (or pad A) sets `item.value` to the typed text and calls `fn(text)`, Esc (or pad B) cancels, Backspace deletes. |
+| `m:label(text, desc)` | Read-only text. `text` is a string, or a function returning the text and an optional value drawn on the right. | Nothing. |
+| `m:submenu(label, desc)` | The label and `›`. | Select opens the submenu. Returns the new menu; its row is `submenu.entry`. |
+
+`label` and `desc` may also be functions; they are called each time they are drawn. A function that raises an error draws `?`.
+
+## Item fields
+
+Set these on the returned item after creating it.
+
+| Field | Applies to | Meaning |
+| --- | --- | --- |
+| `value` | toggle, number, choice, text | The current value (a boolean, a number, the index of the option, or a string). Set it to show a value read from memory. |
+| `min`, `max` | number | Limits. Without them the number is unbounded. |
+| `wrap` | number | When `true`, going past `max` gives `min` and the other way round. |
+| `format` | number | `function(value) return text end`, for how the value is shown. |
+| `step` | number | How much one press changes the value. |
+| `options` | choice | The list of option names. You may replace it, for example in `on_open`. |
+| `unavailable` | all | `function() return reason end`. A string reason draws the row dimmed with the reason on the right, and select and left/right are refused. `true` shows `unavailable`; `nil` or `false` means available. An error in it shows `error`. |
+| `desc` | all | The description string or function. |
+| `note` | toggle | Small text drawn before the check box, a string or a function. Not drawn while the item is unavailable. |
+| `font` | label, number, choice, action | `"mono"` or `"bold"` for the value on the right of a label, number or choice row, or for an action's label. Other rows ignore it. |
+| `file` | all | Set by the menu library: the script file whose load, `on_frame` callback or `script` thread created the item. Items created elsewhere, such as in `on_open`, have none. |
+
+## Menu fields
+
+| Field | Meaning |
+| --- | --- |
+| `m.title` | The name in the bar under the header when this menu is open, drawn in capitals; the root menu shows `MAIN MENU` there. The header always shows the root menu's title as written. |
+| `m.items` | The list of items. You can rebuild it, for example in `on_open`. |
+| `m.sel` | The index of the selected item. |
+| `m.on_open` | `function(m)` called each time `menu.enter` opens the menu, which selecting its row does. It is not called for the root menu, nor when Back returns to the menu. Use it to read current values from memory. |
+| `m.side` | A panel drawn beside the menu while it is open: `{ width = 560, title = text, info = text, draw = function(x, y, w, style) end }`. `title` and `info` may be functions; `info` is drawn at the right of the panel's title bar. `draw` gets the top-left corner under the title bar, the width, and the menu's `style` table. |
+
+The `style` table, rebuilt every time the menu is drawn, carries the menu's measurements so a side panel can match it: `px(v)` and `tx(v)` scale a size from a 1080-pixel-high screen (`tx` also follows `menu.scale`), `mid(top, h, size, font)` gives the y for text centred in a band, and `pad`, `row`, `size`, `small`, `bar`, `accent`, `row_bg`, `label_bg` and `bar_bg` are the menu's own sizes and colours.
+
+## The menu table
+
+| Field or function | Default | Meaning |
+| --- | --- | --- |
+| `menu.open` | `false` | Whether the menu is shown. |
+| `menu.root` | first `menu.new` | The menu F4 opens. |
+| `menu.stack` | `{}` | Open submenus; the last one is shown. `menu.stack = {}` goes back to the root. |
+| `menu.key` | `0x73` (F4) | Virtual-key code that opens and closes the menu. |
+| `menu.keys` | `"both"` | `"numpad"`, `"arrows"` or `"both"`; the sets are in `menu.key_sets`. |
+| `menu.block` | `true` | While the menu is open, the main executable's `user32.dll` imports of `GetAsyncKeyState` and `GetKeyState` report the menu keys as up (injected engine only). |
+| `menu.pad` | `true` | The first connected XInput pad works the menu: RB + A opens and closes it, the D-pad moves and changes values, A selects, B goes back. These buttons are not blocked. |
+| `menu.x`, `menu.y` | `40`, `40` | Position on a 1080-pixel-high screen; scaled to the real height. |
+| `menu.side` | `"left"` | `"left"` or `"right"`: which edge `menu.x` counts from. Not to be confused with a menu's `m.side` panel. |
+| `menu.width`, `menu.rows` | `432`, `12` | Width, and rows shown before the list scrolls. |
+| `menu.scale` | `1` | Text and row size, 0.5 to 2. |
+| `menu.accent` | `0xC2185B` | Header colour as `0xRRGGBB`. |
+| `menu.opacity` | `82` | Row background opacity in percent. |
+| `menu.sound` | `nil` | `function(name)` called with `open`, `close`, `move`, `select`, `refuse` or `back`. |
+| `menu.enter(m)` | | Pushes `m` onto the stack and calls its `on_open`; it is shown while `menu.open` is true. |
+| `menu.why(item)` | | The reason an item is unavailable, or `nil`. |
+| `menu.fit(text, width, size, font)` | | `text` cut with `…` to fit `width` pixels. |
+
+## A menu that reads memory
+
+This file adds a Frames submenu to the root menu, and creates the root menu first when no script loaded before it has. Its first two lines name a build and give it two offsets: `frame_update`, a function the prelude can run the ticks inside, and `frame_count`, a 32-bit value the submenu reads and writes. The build key `12345678:abcdef` and both offsets are made-up example values; replace them with the values for an image you know.
+
+```lua title="scripts/user/frames.lua"
+scripthookvi.builds["12345678:abcdef"] = "my build"
+scripthookvi.offsets["my build"] = { frame_update = 0x12340, frame_count = 0x56780 }
+
+local root = menu.root or menu.new("My scripts")
+local m = root:submenu("Frames", "Reads and sets frame_count.")
+
+local count = m:number("Frame count", 0, 1000, function(v)
+  local at = game.at("frame_count")
+  if at then mem.write(at, "u32", v) end
+end, "Left and right move the counter by 1000.")
+count.min = 0
+count.unavailable = function()
+  if not game.at("frame_count") then return "needs offsets for this build" end
+end
+
+m.on_open = function()
+  local at = game.at("frame_count")
+  count.value = at and mem.read(at, "u32") or count.value
+end
+
+local reset = m:action("Reset on the frame thread", function()
+  game.on_thread(function() mem.write(game.at("frame_count"), "u32", 0) end)
+end, "Writes 0 from the thread that calls frame_update.")
+reset.unavailable = function()
+  if game.mode() ~= "internal" then return "needs the injected engine" end
+  if not game.at("frame_count") then return "needs offsets for this build" end
+end
+
+m:label(function() return "Build", game.build() or "none" end, "The build the engine recognised.")
+```
+
+How it fits together:
+
+- **File name and the root menu.** The engine loads the `.lua` files directly in the scripts folder in name order, then the files in each subfolder, taking the subfolders in name order with `user/` last. See [Scripts](/scripts). The first `menu.new` call becomes `menu.root`, so with `menu.root or menu.new(...)` the first script to load creates the root menu, whose title is the header of every menu, and each later script adds its submenu under it in load order.
+- **`game.at(name)`** turns an offset name from `scripthookvi.offsets` into an address for the running build, or `nil` when the build is unknown or has no such offset. See [Memory](/memory). `mem.write` itself is never gated, so checking the address is the script's job: a `nil` address raises an error, which the menu logs as `menu: <error>`.
+- **`unavailable`** draws the row dimmed with the reason and refuses select and left/right while the process lacks what the item needs, so an item can be listed before it works.
+- **`m.on_open`** reads memory when the submenu is entered, so the items show current values.
+- **`game.on_thread(fn)`** runs `fn` now when this tick runs inside `frame_update` (`hook.ticking()` is true), otherwise on the next tick that does. In the injected engine the ticks move into `frame_update` once `mem.found()` is true and `game.at("frame_update")` gives an address. When `frame_update` has not been called for 250 ms, the engine's timer ticks the scripts instead, and those ticks are not inside it. With the setting `engine.game_thread` set to `false` the prelude does not move the ticks. In the external engine no tick runs inside `frame_update`, so `fn` waits in a queue and never runs. An error in a queued function is logged as `game.on_thread: <error>`.

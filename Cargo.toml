@@ -1,0 +1,42 @@
+[package]
+name = "ScriptHookVI"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "ScriptHookVI-inject"
+path = "src/bin/inject.rs"
+
+[[bin]]
+name = "ScriptHookVI-external"
+path = "src/bin/external.rs"
+
+[dependencies]
+mlua = { version = "0.11", features = ["lua54", "vendored"] }
+fontdue = "0.9.5"
+png = "0.18.1"
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Input_XboxController",
+    "Win32_UI_WindowsAndMessaging",
+] }
+iced-x86 = { version = "1.22.0", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "instr_info"] }
+
+[profile.release]
+debug = "line-tables-only"

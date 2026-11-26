@@ -1,0 +1,222 @@
+---
+title: Install and run
+description: Build ScriptHookVI, run it injected, external or in the preview, and load a first script.
+---
+
+## Requirements
+
+| Need | Why |
+| --- | --- |
+| Rust 1.88 or newer, stable, with the `x86_64-pc-windows-msvc` target | ScriptHookVI is a 64-bit Windows DLL and two Windows programs, built from Linux. The crate uses edition 2024 and naked functions (`#[unsafe(naked)]`), which became stable in Rust 1.88. |
+| [cargo-xwin](https://github.com/rust-cross/cargo-xwin) | Builds for the MSVC target from Linux with `cargo xwin`. |
+| clang and lld (`clang-cl`, `lld-link`) | cargo-xwin uses them to compile the bundled Lua C sources and to link. |
+| Wine | Runs the injector, the external engine and the preview on Linux. |
+| ImageMagick 7 (`magick`) | Only for `preview.sh`, which turns the raw preview frame into a PNG. |
+
+With Rust installed through [rustup](https://rustup.rs), add the target and cargo-xwin:
+
+```bash
+rustup toolchain install stable
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin
+```
+
+Install clang, lld, Wine and ImageMagick from your distribution's packages. Commands on this page run from the repository root.
+
+ScriptHookVI is injected into, or attaches from outside to, a process that is already running. In that process the engine looks for the largest mapped image of at least 64 MB other than the process's own executable, and calls it the title image.
+
+<Info>
+  The project is developed and run under Wine on Linux. Building with plain `cargo build` on Windows and running there is unverified.
+</Info>
+
+## Build and install
+
+<Steps>
+  <Step title="Build the engine, both programs and the examples">
+    ```bash
+    cargo xwin build --release --examples --bins --lib --target x86_64-pc-windows-msvc
+    ```
+    Success: the build ends with a `Finished` line for the `release` profile. `target/x86_64-pc-windows-msvc/release/` then holds `ScriptHookVI.dll`, `ScriptHookVI-inject.exe` and `ScriptHookVI-external.exe`, and its `examples/` folder holds `preview.exe`, which `preview.sh` uses.
+  </Step>
+  <Step title="Install them into bin/">
+    ```bash
+    mkdir -p bin/scripts
+    cp target/x86_64-pc-windows-msvc/release/ScriptHookVI.dll \
+       target/x86_64-pc-windows-msvc/release/ScriptHookVI-inject.exe \
+       target/x86_64-pc-windows-msvc/release/ScriptHookVI-external.exe bin/
+    cp examples/scripts/example.lua bin/scripts/
+    ```
+    `bin/` is ignored by git. The engine looks for its scripts in a `scripts` folder next to itself. `example.lua` builds an example menu.
+
+    Success: `ls bin` shows `scripts`, `ScriptHookVI-external.exe`, `ScriptHookVI-inject.exe` and `ScriptHookVI.dll`, and `ls bin/scripts/` lists `example.lua`.
+  </Step>
+</Steps>
+
+You can copy over `bin/ScriptHookVI.dll` at any time, even while a process runs with it: the injector loads a private copy from `bin/run/`, so the installed file is never in use.
+
+The injected and external engines keep two files next to themselves, in `bin/`:
+
+| File | Contents |
+| --- | --- |
+| `ScriptHookVI.log` | Every `log` and `print` line, plus the engine's own messages, unless the setting `engine.log_file` is false. A script can also call `scripthookvi.log_to_file(false)`, but file logging comes back on after the next `config.set` that changes a value, or the next change to `ScriptHookVI.cfg`, unless `engine.log_file` is false. The preview and `--run` print to the terminal only and write no log file. |
+| `ScriptHookVI.cfg` | The settings scripts store with `config.set`. The preview and `--run` keep settings in memory and write nothing. See [Scripts](/scripts#the-settings-store). |
+
+## Three ways to run the same scripts
+
+Under Wine, run the injector and the external engine in the same Wine prefix as the target process (set `WINEPREFIX`), so they can see it.
+
+<Tabs>
+  <TabItem label="Injected" value="injected">
+    Inject the engine into the target process:
+
+    ```bash
+    wine bin/ScriptHookVI-inject.exe <process>.exe
+    ```
+
+    Arguments: `ScriptHookVI-inject <process.exe | pid> [ScriptHookVI.dll] [seconds to wait]`. The process is required and has no default: give its name (compared without regard to case) or its pid. The DLL defaults to `ScriptHookVI.dll` next to the injector. The injector looks for the process every half second for up to the given seconds, 60 by default. It has no `--help`; run with no argument it prints that usage line and exits with status 2.
+
+    On success it prints `ScriptHookVI loaded into process <pid>` and exits with status 0. Otherwise it prints one of these and exits with status 1: `no such file: <dll>`, `cannot copy <dll> to <copy>`, `no process named <name>` (not found within the wait), `cannot open process <pid>`, `cannot write into process <pid>`, `cannot start a thread in process <pid>`, `process <pid> did not finish loading <dll> within 30 s`, or `process <pid> did not load <dll>`.
+
+    The engine runs inside the target process and draws through its own transparent window over that process's window. This is the only mode where `game.call` reaches the target process, and the only mode where `input.block` and `hook.tick` work.
+
+    By default the engine moves its tick onto the target process's own thread as soon as the title image is found and a script has given its build a `frame_update` offset in `scripthookvi.offsets`, and the log shows `engine tick runs on the game thread via a detour at 0x...`. Scripts then tick each time the process calls the function at `frame_update`. The setting `engine.game_thread` set to `false` keeps the tick on the timer. When that function has not run for 250 ms, the engine ticks on its own timer instead (`engine.tick_ms`, default 16 ms, about 60 a second) and `hook.ticking()` is false. `game.on_thread(fn)` runs `fn` at once when the tick is on the process's thread, and otherwise queues it for the next tick that is.
+
+    Injecting again replaces the running engine: the old one logs `a newer ScriptHookVI took over` and stops, so a rebuilt DLL goes into a running process.
+
+    Success: the injector prints `ScriptHookVI loaded into process <pid>`. The engine then writes `scripts from <folder>` to `bin/ScriptHookVI.log`, one `loaded <file>` line per script, and a `title image at <address>, <size> bytes` line (both numbers in hexadecimal) when it finds the title image. With `example.lua`, F4 opens the example menu over the process's window. With no scripts nothing is drawn: there is no menu until a script creates one with `menu.new`.
+  </TabItem>
+  <TabItem label="External" value="external">
+    The engine runs in its own process and window, and reads and writes the target process through a process handle:
+
+    ```bash
+    wine bin/ScriptHookVI-external.exe <process>.exe
+    ```
+
+    Arguments: `ScriptHookVI-external [--overlay] [--scripts <folder>] [--run <file.lua> [--wait <seconds>]] <process.exe | pid>...`. At least one process name or pid is required; without one it prints `ScriptHookVI-external: name a process or a pid` and exits with status 2. `--run` and `--wait` are described in [Run one file once](#run-one-file-once) below. `--help` (or `-h`) prints the usage line and exits.
+
+    It attaches when the process appears, detaches when it exits, and loads the scripts again on each change. `--overlay` draws over the process's window instead of in its own window. The external engine always ticks on its own timer.
+
+    `game.call` needs the injected engine; from here it raises a Lua error. Memory reads, writes and scans work.
+  </TabItem>
+  <TabItem label="No process" value="no-process">
+    Run the same `ScriptHookVI-external.exe` with the name of a process that is not running. `game.status()` returns `no game`, `game.mode()` returns `detached`, and memory calls act on the engine's own process.
+
+    Use this to work on menus and drawing in a window. For a picture without a window, use the preview below.
+  </TabItem>
+</Tabs>
+
+`game.status()` tells you the state: `internal`, `external` or `preview`, then `build <name>` (the name `scripthookvi.builds` gives the image), `unknown build` (a title image whose link stamp and size no script has added to `scripthookvi.builds`, see [Memory](/memory#builds-and-offsets)) or `title not found`. When the external engine has no process attached it returns `no game`.
+
+### Choosing the scripts folder
+
+By default the engine loads `scripts/` next to `ScriptHookVI.dll` or `ScriptHookVI-external.exe`: every `.lua` file in it in name order, then every `.lua` file directly inside each subfolder, the subfolders in name order with `user/` always last. The engine creates `user/` when it starts. A set of scripts installs by putting its folder into `scripts/`: a copy, a `git clone` or a symbolic link. See [Scripts](/scripts#load-order).
+
+To load another folder:
+
+- Injected engine: set `SCRIPTHOOKVI_SCRIPTS` in the environment the target process starts with. The DLL reads it inside the target process when it loads; setting it for the injector does nothing, and the injector has no `--scripts`.
+- External engine: set `SCRIPTHOOKVI_SCRIPTS` for `ScriptHookVI-external.exe`, or pass `--scripts <folder>`, which wins over the variable.
+
+Under Wine, give the folder as a Windows path, as for `--run` below: `Z:` followed by the absolute Linux path.
+
+## Menu keys
+
+These keys work a menu once a script has created one with `menu.new`; the first menu created becomes `menu.root`, which F4 opens. A script sets `menu.keys` to `"numpad"`, `"arrows"` or `"both"` (the default), and `menu.key` to another virtual-key code than F4 (`0x73`).
+
+| Action | Numpad | Arrows |
+| --- | --- | --- |
+| Open and close | F4 | F4 |
+| Move up and down | Num8, Num2 | Up, Down |
+| Select | Num5 | Enter |
+| Change a number or choice | Num4, Num6 | Left, Right |
+| Back | Num0 | Backspace |
+
+Holding a move or change key steps once, then repeats after 400 ms, faster the longer it is held.
+
+While the menu is open, `menu.block` (true by default) hides the move, select, change and back keys of the active `menu.keys` set (not F4), and during text entry also the typing keys, from the `GetAsyncKeyState` and `GetKeyState` imports of the target process's executable, in the injected engine only. A process that reads the keyboard any other way still sees them.
+
+### Controller
+
+The first XInput pad works the menu while `menu.pad` is true (the default): RB + A opens and closes, the D-pad moves and changes values, A selects, B goes back. The target process still sees these buttons.
+
+### Text entry
+
+Selecting a text row opens an entry line under the menu. Letters, digits, space and punctuation type (Shift gives capitals and the second symbol on a key), Backspace deletes, Enter or A accepts, Esc or B cancels. A script makes a text row with `m:text(label, value, fn)`, and `fn` receives the accepted text.
+
+## A first script
+
+Your own scripts go in `bin/scripts/user/`. Create the folder if no engine has started yet (`mkdir -p bin/scripts/user`), then create `bin/scripts/user/hello.lua`:
+
+```lua title="bin/scripts/user/hello.lua"
+log("hello from", game.status())
+
+on_frame(function(ms)
+  local text = string.format("hello  %.1f s", ms / 1000)
+  ui.rect(20, ui.height() - 60, ui.text_width(text, 18) + 24, 36, 0xC0000000, 6)
+  ui.text(32, ui.height() - 60 + 8, text, 0xFFFFFFFF, 18)
+end)
+```
+
+Save it while an engine runs. Within half a second the engine loads every script again, logs `hello from` with the status and then `loaded user/hello.lua`, and draws the box in the bottom-left corner. A mistake in the file shows up in the log as `user/hello.lua: <error>`, and the other files still load.
+
+Without a target process, check it with `SCRIPTS=bin/scripts ./preview.sh /tmp/hello.png`: the terminal shows `ScriptHookVI: loaded example.lua`, a `ScriptHookVI: hello from preview, ...` line that ends with the rest of `game.status()`, and `ScriptHookVI: loaded user/hello.lua`. The picture shows the example menu, which the preview opens by default, and the box reading `hello  0.0 s` (a preview runs only three ticks, 16 ms apart).
+
+## Preview: a picture with no process
+
+`preview.sh` builds the preview example, loads a scripts folder, runs three ticks and writes the last frame to a PNG. It attaches to no process and opens no window. It prints the build output only when the build fails, and then exits with status 1.
+
+```bash
+SCRIPTS=examples/scripts ./preview.sh out.png 'menu.open = true'
+```
+
+| Input | Meaning |
+| --- | --- |
+| first argument | Output PNG, relative to the folder you call it from. Default `/tmp/ScriptHookVI-preview.png`. |
+| second argument | Lua code run after the scripts load. Default `menu.open = true`. |
+| `SCRIPTS` | Scripts folder to load, relative to the repository root, with its subfolders. Default `scripts`, which the repository does not include. |
+| `SIZE` | Frame size. Default `1280x720`. |
+| `BACK` | ImageMagick background under the frame. Default a plain purple. |
+
+The preview runs under Wine in the default prefix (`~/.wine`) unless `WINEPREFIX` is set; the first run creates the prefix.
+
+The engine's log lines (`ScriptHookVI: loaded ...`, errors) are printed to the terminal, and the last line is the path of the PNG. In the preview `game.mode()` returns `preview` and settings stay in memory.
+
+Success: one `ScriptHookVI: loaded <file>` line per script and no error lines, then the PNG path. With `SCRIPTS=examples/scripts` the picture shows the example menu. With a folder that holds no scripts nothing is drawn, so the picture is the plain purple background.
+
+The code argument can build a menu and open a submenu in the picture, for example:
+
+```bash
+./preview.sh out.png 'local m = menu.new("Example"); local sub = m:submenu("Inside"); sub:action("Hello", function() log("hello") end); menu.open = true; menu.enter(sub)'
+```
+
+`input.feed` plays key presses before the frame is taken, and the preview keeps ticking until the feed is done:
+
+```bash
+./preview.sh out.png 'local m = menu.new("Example"); m:action("First"); m:number("Count", 0, 1); menu.open = true; input.feed({ 0x28, { 0x27, ms = 1000 } })'
+```
+
+## Run one file once
+
+`ScriptHookVI-external.exe --run <file.lua> <process.exe | pid>` attaches to the process, runs that one file from top to bottom, prints its `print` and `log` lines and exits. It shows no window and keeps settings in memory only.
+
+```bash
+wine bin/ScriptHookVI-external.exe --run Z:/path/to/file.lua --wait 10 <process>.exe
+```
+
+Under Wine, give the file as a Windows path: `Z:` followed by the absolute Linux path.
+
+| Option | Meaning |
+| --- | --- |
+| `--wait <seconds>` | How long to wait for the process to appear. Default 0: exit at once when it is not running. |
+| process names | As for the external engine. At least one is required. |
+
+| Exit code | Meaning |
+| --- | --- |
+| `0` | The file ran to the end. |
+| `1` | The file raised an error; the error is printed. |
+| `2` | No process to attach to (`no game process to attach to`), or no process name given (`ScriptHookVI-external: name a process or a pid`). |
+
+`--run` loads only the engine's built-in API, not the scripts folder: `scripthookvi.builds` and `scripthookvi.offsets` start empty, so unless the file fills them `game.build()` returns `unknown` once the title image is found and `game.at` returns nil. It runs as the external engine (`game.mode()` is `external`), so memory reads, writes and scans work, and `game.call` cannot be called from it.
+
+<Warning>
+  `--run` runs the file once and never ticks. Callbacks registered with `on_frame` or `script` do not run, and nothing is drawn. Do the work at the top level of the file.
+</Warning>

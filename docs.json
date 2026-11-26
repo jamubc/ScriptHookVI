@@ -1,0 +1,50 @@
+{
+  "$schema": "https://docs.page/schema.json",
+  "name": "ScriptHookVI",
+  "description": "ScriptHookVI is a Lua scripting engine that is injected into a running Windows process. Scripts read and write the process's memory, call functions in it, draw over its window and build menus.",
+  "sidebar": [
+    {
+      "group": "Getting started",
+      "pages": [
+        {
+          "title": "Introduction",
+          "href": "/"
+        },
+        {
+          "title": "Install and run",
+          "href": "/getting-started"
+        }
+      ]
+    },
+    {
+      "group": "Writing scripts",
+      "pages": [
+        {
+          "title": "Scripts",
+          "href": "/scripts"
+        },
+        {
+          "title": "Menus",
+          "href": "/menus"
+        },
+        {
+          "title": "Memory",
+          "href": "/memory"
+        },
+        {
+          "title": "Drawing",
+          "href": "/drawing"
+        }
+      ]
+    },
+    {
+      "group": "Reference",
+      "pages": [
+        {
+          "title": "Lua API",
+          "href": "/lua-api"
+        }
+      ]
+    }
+  ]
+}

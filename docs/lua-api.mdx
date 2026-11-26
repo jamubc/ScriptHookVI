@@ -1,0 +1,187 @@
+---
+title: Lua API
+description: The globals, tables and functions of the engine and the prelude, with signatures and return values.
+---
+
+Scripts run in Lua 5.4 with the standard libraries except `debug`. The **Source** column says where each name comes from: the engine (`src/engine.rs`) or the prelude (`src/prelude.lua`, loaded before every script).
+
+Square brackets mark optional arguments. "Injected only" means the call works only in the injected engine. The title image is the largest module of at least 64 MB in the target process other than its main executable; when there is no such module, the engine looks through the process's memory for an image of that size.
+
+## Globals
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `on_frame(fn)` | | prelude | Calls `fn(ms)` every tick; `ms` is milliseconds since the engine started (in the preview, 16 more each tick). |
+| `script(fn)` | | prelude | Starts `fn` as a thread resumed each tick. |
+| `wait([ms])` | | prelude | Inside a thread: pause for at least `ms` milliseconds, or until the next tick. |
+| `log(...)` | | engine | Writes the arguments, joined by spaces, to standard error and, when `scripthookvi.log_path` is set and writing the log file is on (the setting `engine.log_file`, or `scripthookvi.log_to_file`), to `ScriptHookVI.log`. |
+| `print(...)` | | engine | The same function as `log`. |
+| `now()` | float | engine | Milliseconds since the engine started. |
+| `joaat(str)` | integer | engine | The Jenkins one-at-a-time hash of the string with ASCII letters lowercased, as an unsigned 32-bit integer. |
+
+See [Scripts](/scripts) for the tick order, threads and errors.
+
+## mem
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `mem.base()` | integer | engine | Base address of the title image (of the process's main executable until it is found). |
+| `mem.size()` | integer | engine | Size of that image in bytes. |
+| `mem.found()` | boolean | engine | Whether the title image is located. |
+| `mem.set_base(addr)` | | engine | Use the image at `addr` as the title image. |
+| `mem.rva(offset)` | integer | prelude | `mem.base() + offset`. |
+| `mem.sections()` | list | prelude | The image's sections as `{ name, addr, size }` tables, read from its PE header; an empty list when there is no PE header at the base. |
+| `mem.read(addr, type)` | number or `nil` | engine | Reads one value; `nil` when unreadable. An unknown type name raises an error. |
+| `mem.write(addr, type, value)` | boolean | engine | Writes one value (number or boolean); lifts read-only protection for the write. |
+| `mem.bytes(addr, n)` | string or `nil` | engine | `n` raw bytes (at most 64 MB); `nil` when unreadable. |
+| `mem.poke(addr, str)` | boolean | engine | Writes the bytes of `str`, lifting read-only protection like `mem.write`. |
+| `mem.string(addr [, max])` | string | engine | Bytes up to the first zero, at most `max` (default 256, cap 65536). |
+| `mem.cstr(str)` | integer | prelude | Address of a zero-terminated copy of `str` in a 64 KB ring buffer that is reused as it fills. A string longer than 65535 bytes raises an error. |
+| `mem.alloc(n)` | integer | engine | Address of `n` zeroed bytes that are never freed; inside the target process when the external engine is attached. |
+| `mem.scan(pattern [, start, len, limit])` | list of integers | engine | Addresses matching a pattern of hex bytes and `??`, such as the example `"48 8B 05 ?? ?? ?? ??"`. Defaults: the title image, and `limit` 1. A bad pattern raises an error. |
+| `mem.deref(addr, off1, ...)` | integer or `nil` | prelude | Follows a pointer chain and returns the final address; `nil` at a null or unreadable pointer. |
+| `mem.struct(addr, layout)` | table | prelude | A table whose fields read and write memory; `layout` maps names to `{ offset, type }` or `{ offset, layout }`. Its `addr` field is `addr`. |
+
+Types for `read` and `write`: `u8 i8 u16 i16 u32 i32 u64 i64 f32 f64 ptr`. See [Memory](/memory).
+
+## sig
+
+Names for addresses found by a byte pattern, defined in the prelude.
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `sig.define(name, { pattern = "48 8B 05 ?? ?? ?? ??", offset = 3, rip = true, deref = 0, add = 0 [, section = ".text"] })` | | prelude | Names an address found by a byte pattern; the pattern and numbers shown are example values. Only `pattern` is required. A bad name, pattern, number or section raises an error. |
+| `sig.get(name)` | integer, or `nil, reason` | prelude | The address. |
+| `sig.all()` | list | prelude | Every name as `{ name, pattern, state, addr, rva, reason, from, scans }`; `state` is `pending` (not searched for this image yet), `found` or `failed`. |
+| `sig.rescan()` | | prelude | Forgets what is kept for this build, so the next `sig.get` of each name searches again. |
+
+`sig.define` only records a copy of the definition. The first `sig.get` of a name searches the title image (or the named section) with `mem.scan`. One match gives the address: the match plus `offset`, then with `rip` the 32-bit displacement there is followed (the address after the displacement plus the displacement), then `deref` pointers are read, then `add` is added. The reasons are `not defined`, `no title`, `no section <name>`, `not found`, `2 matches` up to `16 or more matches`, `null pointer` and `unreadable`.
+
+A match is kept in the settings as its offset from the image base, under `sig.<link stamp>:<image size>.<name>`; names are printable ASCII without spaces or `=`. The next start checks that the pattern still matches at that offset and searches the image again only when it does not. Failures are not kept. `sig.all()` lists every name with its offset or the reason it failed.
+
+## game
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `game.mode()` | string | engine | `internal`, `external`, `detached` (external engine while no named process is attached) or `preview`. A file run with `ScriptHookVI-external --run` sees `external`. |
+| `game.pid()` | integer | engine | The id of the process the engine reads; `0` in the preview. |
+| `game.stamp()` | integer or `nil` | engine | Link time stamp of the title image; `nil` when it is not found. |
+| `game.build()` | string or `nil` | prelude | Build name from `scripthookvi.builds`, `"unknown"`, or `nil` with no title image. |
+| `game.at(name)` | integer or `nil` | prelude | The address of the named offset for the current build: `scripthookvi.offsets[game.build()][name]` plus the image base. `nil` when the build is unknown or has no such name. |
+| `game.on_thread(fn)` | value or nothing | prelude | When this tick runs inside the `hook.tick` detour, runs `fn` now and returns what it returns. Otherwise queues `fn` for the next tick that does and returns nothing. An error in a queued `fn` is logged as `game.on_thread: <error>`. |
+| `game.status()` | string | prelude | A one-line summary, such as `internal, build <name>`, `external, unknown build`, `internal, title not found` or `no game`. |
+| `game.call(addr, ...)` | integer, or `nil, reason` | engine | Calls a function with up to 32 integer, boolean or `nil` arguments and returns `rax`. A fault inside the call returns `nil, "fault <code> at <address>"` (`0xC0000005` for an access violation) and the process keeps running. More than 32 arguments, or one of another type, raise an error. The address is not checked. Injected only: attached from the external engine it raises the error `calls need the injected engine; this one is external`, and detached or in the preview it calls into the engine's own process. |
+| `game.fn(addr, "f32(ptr, f32, i32)")` | function | engine | A Lua function that calls `addr` with that signature. It returns the typed result, or `nil, reason` on a fault, and works where `game.call` works. |
+
+A `game.fn` signature is a return type and up to 32 argument types: `i8 u8 i16 u16 i32 u32 i64 u64 ptr bool f32 f64`, and `void` as the return type. Arguments follow the Windows x64 calling convention. Integer arguments take integers, booleans (1 and 0) or `nil` (0); float arguments take any number. The return value is cut to its type's width, `bool` reads `al`, `f32` and `f64` read `xmm0`, and `void` returns `true`. A bad signature, a wrong argument count or a wrong argument type raises an error.
+
+## input
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `input.down(vk)` | boolean | engine, prelude | Whether the key with this virtual-key code is held (`GetAsyncKeyState`), or held by `input.feed`. |
+| `input.pressed(vk)` | boolean | prelude | Whether the key went down this tick. The first call for a key returns `false` and starts tracking it. |
+| `input.held(vk)` | float or `false` | prelude | Milliseconds the key has been down (counted from the first call that tracks it), or `false`. |
+| `input.repeated(vk [, delay_ms, rate_ms])` | boolean | prelude | `true` on the press, then after `delay_ms` (400) every `rate_ms` (120), each gap 15% shorter, down to a quarter of `rate_ms`. |
+| `input.pad()` | table | engine, prelude | The first connected XInput pad: `connected`, buttons `a b x y lb rb back start ls rs dpad_up dpad_down dpad_left dpad_right` as booleans, sticks `lx ly rx ry` from -1 to 1, triggers `lt rt` from 0 to 1. No pad or no XInput DLL gives `connected = false`. |
+| `input.feed(steps)` | | prelude | Plays presses over the next ticks. A step is a vk (one tick down, one up) or `{ vk, ..., ms = hold, pad = { "rb", "a", lx = 0.5 } }` (held together for `ms`, then one tick up); `pad` replaces the real pad while the feed runs. The preview keeps ticking until the feed is done. |
+| `input.feeding()` | boolean | prelude | Whether a feed is still playing. |
+| `input.block([keys])` | | engine | Makes the `user32.dll` imports `GetAsyncKeyState` and `GetKeyState` of the process's main executable read the keys in the list as up; no list clears it. Injected only. The menu replaces the list whenever its own set of keys changes, such as when it opens or closes. |
+
+A pad button name such as `"a"` works as `vk` in `input.pressed`, `input.held` and `input.repeated`.
+
+## hook
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `hook.tick(addr)` | | engine | From the next engine loop, detours the function at `addr` so that each call to it runs one tick on the calling thread and then continues into the function. Injected only; logs `engine tick runs on the game thread via a detour at <addr>`, `hook.tick failed: <reason>`, or in the external engine `hook.tick needs the injected engine` (with `--run` it does nothing and logs nothing). |
+| `hook.tick()`, `hook.untick()` | | engine | Removes the detour and returns the tick to the engine's timer. |
+| `hook.ticking()` | boolean | engine | Whether this tick runs inside the detour. |
+
+While the detour is active and the detoured function has run within the last 250 ms, the engine's own thread only presents what the detour's tick drew. Otherwise the engine ticks on its timer and `hook.ticking()` is `false`. The external engine always ticks on its timer. The raw detour primitive is not exposed to Lua.
+
+In the injected engine the prelude calls `hook.tick(game.at("frame_update"))` once by itself, as soon as the title image is found and the build has a `frame_update` offset, unless the setting `engine.game_thread` is `false`. A script can still call `hook.untick()` and `hook.tick(addr)`.
+
+## ui
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `ui.width()`, `ui.height()` | integer | engine | Size of the drawing surface in pixels. |
+| `ui.rect(x, y, w, h, color [, radius, end_color, direction])` | | engine | Filled rectangle; gradient to `end_color`, `"vertical"` (default) or `"horizontal"`. |
+| `ui.frame(x, y, w, h, color [, thickness, radius])` | | engine | Rectangle outline, drawn inside it; `thickness` 1 by default. |
+| `ui.line(x1, y1, x2, y2, color [, thickness])` | | engine | Line with square ends; `thickness` 1 by default. |
+| `ui.circle(cx, cy, r, color)` | | engine | Filled circle. |
+| `ui.triangle(x1, y1, x2, y2, x3, y3, color)` | | engine | Filled triangle. |
+| `ui.clip(x, y, w, h)`, `ui.clip()` | | engine | Cut later commands of the tick to a rectangle, or remove the cut. Some but not all four arguments raise an error. |
+| `ui.text(x, y, text [, color, size, font] [, options])` | | engine | Text; `color` defaults to white, `size` to 16, `font` is `"regular"` (default), `"bold"` or `"mono"`. |
+| `ui.text_width(text [, size, font] [, options])` | float | engine | Width of the text in pixels; uses the `spacing` and `tabular` options. |
+| `ui.line_height([size, font])` | float | engine | Height of one line of text. |
+| `ui.image_load(path)` | `id, width, height` or `nil, message` | engine | Loads a PNG relative to the scripts folder. The same path gives the same id. |
+| `ui.image(id, x, y [, w, h, tint])` | | engine | Draws a loaded image; `h` follows `w` when left out, and `tint` multiplies its colours. |
+
+The options table is the last argument of `ui.text` and `ui.text_width`: `{ align = "left" / "center" / "right", spacing = px, max_width = px, tabular = true }`. `align` is relative to `x` (in `ui.text` another value raises an error; `ui.text_width` ignores `align` and `max_width`), `spacing` adds pixels between letters, `max_width` cuts the text with `…`, and `tabular` gives every digit the width of the widest one. `regular` and `bold` are Inter, `mono` is JetBrains Mono.
+
+Colours are `0xAARRGGBB`. See [Drawing](/drawing).
+
+## config
+
+| Signature | Returns | Source | Meaning |
+| --- | --- | --- | --- |
+| `config.get(key [, default])` | value | engine | The stored value, or `default`. |
+| `config.set(key, value)` | | engine | Stores a boolean, number or string; `nil` removes the key. Raises an error for a bad key or value. |
+| `config.all()` | table | engine | A copy of every setting. |
+| `config.path()` | string or `nil` | engine | Path of `ScriptHookVI.cfg`; `nil` in the preview and with `--run`, where settings stay in memory. |
+
+See [the settings store](/scripts#the-settings-store).
+
+## scripthookvi
+
+| Name | Type | Source | Meaning |
+| --- | --- | --- | --- |
+| `scripthookvi.version` | string | engine | The engine version from `Cargo.toml`. |
+| `scripthookvi.reload()` | function | engine | Reloads every script on the engine's next loop. Does nothing in the preview and with `--run`. |
+| `scripthookvi.rescan()` | function | engine | Looks for the title image again. |
+| `scripthookvi.log_to_file(on)` | function | engine | Turns writing `ScriptHookVI.log` on or off until the next `config.set` that changes a value, or the next reload of the settings file, which apply `engine.log_file` again. |
+| `scripthookvi.scripts_dir` | string | engine | The scripts folder (with `--run`, the folder of the file being run). |
+| `scripthookvi.log_path` | string or `nil` | engine | Path of `ScriptHookVI.log`; `nil` in the preview and with `--run`. |
+| `scripthookvi.scripts()` | function | prelude | One table per script file, in load order: `name`, its path relative to the scripts folder, such as `example.lua` or, for a made-up user script, `user/extra.lua`, `state` (`loaded`, `failed` or `disabled`), `error` and `line` when failed, `load_ms`, the `frames`, `threads` and `items` (menu items) it registered, `enabled` (its setting, applied at the next reload), `core` (a name matching `^0%d_`, always loaded), `user` (under `user/`). |
+| `scripthookvi.builds` | table | prelude | `"<stamp>:<size>"` in hex to build name, empty until a script fills it. `game.build` reads it. |
+| `scripthookvi.offsets` | table | prelude | Build name to a table of named offsets from the image base, empty until a script fills it. `game.at` reads it. |
+| `scripthookvi.tick(ms)` | function | prelude | The tick the engine calls. Scripts do not call it. |
+
+## menu
+
+The menu library is described in full on [Menus](/menus). The prelude creates no menu: `menu.root` is `nil` and nothing is drawn until a script calls `menu.new`, and `menu.key` (F4 by default) then opens `menu.root`.
+
+| Signature | Returns | Meaning |
+| --- | --- | --- |
+| `menu.new(title)` | menu | A new menu; the first one becomes `menu.root`. |
+| `m:action(label [, fn, desc])` | item | Calls `fn()` on select. |
+| `m:toggle(label, value [, fn, desc])` | item | Flips `value` on select and calls `fn(value)`. |
+| `m:number(label, value [, step, fn, desc])` | item | Left and right change `value` by `step` (default 1); calls `fn(value)`. |
+| `m:choice(label, options [, index, fn, desc])` | item | Left and right step through `options`, starting at `index` (default 1); calls `fn(index, option)`. |
+| `m:text(label [, value, fn, desc])` | item | A row showing the string `value`; select opens an entry line under the menu, and Enter sets `value` and calls `fn(text)`. |
+| `m:label(text [, desc])` | item | Read-only row; `text` may be a function returning text and a value. |
+| `m:submenu(label [, desc])` | menu | A nested menu. |
+| `m.on_open` | function | `function(m)`, called each time `menu.enter` pushes the menu, as selecting a submenu row does; opening the menu does not call the root menu's `on_open`. |
+| `m.side` | table | A panel beside the menu while it is open: `{ width, title, info, draw = function(x, y, w, style) end }`. |
+| `menu.enter(m)` | | Pushes `m` onto `menu.stack` and calls its `on_open`; it is shown while `menu.open` is true. |
+| `menu.change(item, d)` | | Steps a number or choice by `d` as left and right do. |
+| `menu.why(item)` | string or `nil` | Why the item is unavailable. |
+| `menu.shown(item)` | string or `nil` | The text shown for a number or choice value. |
+| `menu.fit(text, width [, size, font])` | string | `text` cut with `…` to fit. |
+| `menu.draw(m)` | | Draws menu `m`; the prelude calls it each tick while the menu is open. |
+| `menu.pad` | boolean | Whether the first XInput pad drives the menu (RB + A opens and closes it); `true` by default. |
+| `menu.typing` | table or `nil` | `{ item, text }` while a text row's entry line is open. |
+| `menu.side` | string | `"left"` (default) or `"right"`: which screen edge `menu.x` counts from. |
+
+Other fields: `menu.open`, `menu.root`, `menu.stack`, `menu.key`, `menu.keys`, `menu.key_sets`, `menu.block`, `menu.x`, `menu.y`, `menu.width`, `menu.rows`, `menu.scale`, `menu.accent`, `menu.opacity`, `menu.sound`, `menu.style`. Menu fields: `title`, `items`, `sel`, `entry`. Item fields: `kind`, `label` (`text` for a label row), `desc`, `value`, `step`, `options`, `fn` (the callback), `menu` (a submenu row's menu), and these:
+
+| Field | Meaning |
+| --- | --- |
+| `item.unavailable` | `function() return reason end`: a string draws the row dimmed with the reason and refuses select and left/right; `true` shows `unavailable`. |
+| `item.min`, `item.max`, `item.wrap` | Limits of a number, and whether going past one gives the other. |
+| `item.format` | `function(value) return text end`: how a number is shown. |
+| `item.note` | Small text before a toggle's box, a string or a function. |
+| `item.file` | The script file that created the item, set by the menu library. |
+| `item.font` | The font of a label row's value, of a number's or choice's value, or of an action's label. |

@@ -1,0 +1,199 @@
+---
+title: Scripts
+description: How the engine loads, ticks and reloads scripts, and how scripts keep settings.
+---
+
+A script is any `.lua` file in the scripts folder or directly inside one of its subfolders, such as `user/`. The scripts folder is `scripts/` next to the engine unless `SCRIPTHOOKVI_SCRIPTS` or `--scripts` names another; see [Install and run](/getting-started#choosing-the-scripts-folder). The engine runs Lua 5.4 with the standard libraries except `debug`, the engine's own tables (`mem`, `game`, `ui`, and so on) and the prelude library from `src/prelude.lua`.
+
+## Load order
+
+When the engine starts, and on every reload, it:
+
+1. Creates a fresh Lua state and registers the engine API and the prelude.
+2. Lists every `.lua` file directly in the scripts folder, sorted by name, then every `.lua` file directly inside each subfolder, sorted by name, taking the subfolders in name order with `user/` always last. Deeper folders are not read.
+3. Runs each file once from top to bottom, in that order, and logs `loaded <file>` for each file that loads without an error.
+
+`user/` is the place for your own scripts. The engine creates it when it starts, and its files are named `user/<file>` in the log and in `scripthookvi.scripts()`.
+
+A set of scripts that lives in a folder of its own installs by putting that folder into the scripts folder: a copy, a `git clone`, or a symbolic link. Its files load after the files directly in the scripts folder and before `user/`, in the order of their names, and are named by their path relative to the scripts folder with forward slashes, such as `mymenu/10_main.lua`.
+
+A file whose setting `scripts.<file>.enabled` is `false` is skipped and logged as `<file>: disabled in the settings`. A file whose name starts with `0`, a digit and `_`, such as `05_setup.lua` directly in the scripts folder, always loads. See [the settings store](#the-settings-store).
+
+Each file loads on its own. A file with a syntax error, or one that raises an error while it runs, is logged as `<file>: <error>` and marked failed in `scripthookvi.scripts()`. Loading carries on with the next file, and whatever the failed file defined before the error stays defined.
+
+`scripthookvi.scripts()` lists every file in load order. Each entry has its `name`, its `state` (`loaded`, `disabled` or `failed`), `error` and `line` (the line of the error when the message names one) for a failed file, and `enabled`. A file is turned off or on with `config.set("scripts.<file>.enabled", false)` or `true`; the change applies from the next reload, and `scripthookvi.reload()` does one.
+
+```lua title="scripts/user/50_failed.lua"
+for _, s in ipairs(scripthookvi.scripts()) do
+  if s.state == "failed" then
+    log(s.name, "failed:", s.error)
+  end
+end
+```
+
+All files share one Lua state. A global defined in `10_helpers.lua` is visible in `user/mod.lua`, so keep helpers `local` unless other files need them. Number prefixes such as `10_` and `50_` set the order of the files within a folder.
+
+## Hot reload
+
+Every half second the engine compares the list of `.lua` files in the scripts folder and in its subfolders, and their modification times, with the last load. Any change (a file saved, added or removed) reloads every script into a new Lua state.
+
+A reload throws away everything held in Lua: variables, menus, callbacks and threads. It also clears the `input.block` list. The [settings store](#the-settings-store) survives, and a tick already moved onto the target process's thread stays there. Write scripts so that loading them again from scratch is always safe.
+
+Other reloads:
+
+| Trigger | Effect |
+| --- | --- |
+| `scripthookvi.reload()` | Reloads every script on the engine's next pass, without waiting for the half-second check. It does nothing in the preview or with `--run`. |
+| External engine attaches to or detaches from the process | Reloads every script, so they see the new mode. |
+| Injecting the engine again | The new engine replaces the old one and loads the scripts itself. |
+
+## The tick
+
+The engine ticks the scripts on its own thread and waits `engine.tick_ms` milliseconds (1 to 1000, default 16) between ticks. In the injected engine, when the build of the target process has a `frame_update` offset in `scripthookvi.offsets`, the engine moves the tick onto the thread that runs that function, and there scripts tick once per call of it; see [below](#ticking-inside-the-process). Each tick, in this order:
+
+1. The key states used by `input.pressed` are updated.
+2. Every `on_frame` callback runs, in the order they were registered, with the tick time in milliseconds.
+3. Every script thread whose `wait` has run out is resumed.
+4. The menu reads its keys and, while it is open and a script has made one with `menu.new`, draws itself. With no menu nothing is drawn here.
+5. The engine draws everything the tick asked for. Drawing commands do not persist: anything that should stay on screen is drawn again every tick.
+
+### Ticking inside the process
+
+In the injected engine, the engine calls `hook.tick(game.at("frame_update"))` once by itself as soon as `mem.found()` is true and the build has a `frame_update` offset, unless the setting `engine.game_thread` is `false`, and logs `engine tick runs on the game thread via a detour at <address>`. `game.at(name)` is the address of the named offset in `scripthookvi.offsets` for the build of the target process, or `nil` when the build is unknown or has no such name. `scripthookvi.builds` and `scripthookvi.offsets` start empty and no file in the repository fills them, so this happens only after a script has filled them; see [Builds and offsets](/memory#builds-and-offsets). `hook.tick(addr)` detours the function at `addr`, so each tick runs inside that function, and `hook.ticking()` is true there. A script can call `hook.tick(addr)` itself, and `hook.untick()` returns the tick to the timer; see [Lua API](/lua-api#hook).
+
+When the detoured function has not run for 250 milliseconds, the engine ticks on its timer again until it runs again, and `hook.ticking()` is false during those ticks. The external engine always ticks on its timer.
+
+`game.on_thread(fn)` runs `fn` on that thread. When `hook.ticking()` is true it calls `fn` at once and returns what `fn` returns; otherwise it queues `fn` for the next tick on that thread and returns nothing. Queued functions run before the scripts' `on_frame` callbacks of that tick, and one that raises an error is logged as `game.on_thread: <error>`. Where the tick never moves onto that thread, as in the external engine, a queued function never runs.
+
+## Per-frame callbacks
+
+`on_frame(fn)` registers `fn` to run every tick. It receives the tick time in milliseconds since the engine started; in the preview the tick time counts 0, 16, 32 and so on, 16 ms per tick.
+
+```lua title="scripts/50_clock.lua"
+local last = 0
+
+on_frame(function(ms)
+  if ms - last >= 5000 then
+    last = ms
+    log(string.format("five seconds passed, now %.0f ms", ms))
+  end
+end)
+```
+
+There is no way to remove a callback; return early instead. A callback that raises an error is stopped until the next reload; see [Errors](#errors).
+
+## Script threads and wait
+
+`script(fn)` starts `fn` as a thread (a Lua coroutine) that the engine resumes each tick. Inside it, `wait(ms)` pauses the thread for at least `ms` milliseconds; `wait()` or `wait(0)` pauses it until the next tick. Use threads for anything that happens in steps over time.
+
+```lua title="scripts/50_steps.lua"
+script(function()
+  log("step one")
+  wait(1000)
+  log("step two, a second later")
+  while true do
+    wait(10000)
+    log("every ten seconds", game.status())
+  end
+end)
+```
+
+`wait` only works inside a thread. At the top level of a file or inside `on_frame` it raises `attempt to yield from outside a coroutine`. A thread ends when its function returns.
+
+## Errors
+
+| Where the error happens | What the engine does |
+| --- | --- |
+| Loading a file | Logs `<file>: <error>`, marks the file failed in `scripthookvi.scripts()` and loads the next file. |
+| An `on_frame` callback | Logs `<file>: on_frame stopped: <error>` once, stops that callback and marks its file failed. Other callbacks keep running. |
+| A script thread | Logs `<file>: script stopped: <error>`, ends that thread and marks its file failed. |
+| A menu callback (`fn` of an item, `on_open`, `side.draw`, `menu.sound`) | Logs `menu: <error>`; the menu keeps working. |
+| The menu itself | Closes the menu and logs `menu: <error>`. |
+| Anywhere else in the tick | Logs `tick: <error>` once, and again only when the text of the error changes. The preview logs it on every tick. |
+
+`<file>` is the file that registered the callback or thread. One registered while no file was loading or running, for example from a menu callback, logs `on_frame: <error>` or `script: <error>` instead, and is stopped the same way.
+
+## Logging
+
+`log(...)` and `print(...)` are the same function. They join their arguments with spaces and write the line to standard error (prefixed `ScriptHookVI: `) and to `ScriptHookVI.log` next to the engine.
+
+- Set `engine.log_file = false` in the settings to stop writing the file. `scripthookvi.log_to_file(false)` stops it too, but only until the next change to any setting, which turns the file back on unless `engine.log_file` is `false`. The line still goes to standard error.
+- The preview and `ScriptHookVI-external --run` write no log file; `scripthookvi.log_path` is `nil` there.
+
+`now()` returns milliseconds since the engine started, as a float. It does not reset on reload.
+
+## Keyboard
+
+| Call | Returns |
+| --- | --- |
+| `input.down(vk)` | `true` while the key with Windows virtual-key code `vk` is held. |
+| `input.pressed(vk)` | `true` on the tick the key went down. A key is tracked from the first call that asks about it, and that first call returns `false`. |
+| `input.block({ vk, ... })`, `input.block()` | In the injected engine, makes the target process's `GetAsyncKeyState` and `GetKeyState` imports report the listed keys as up; each call replaces the list, and no list clears it. The menu sets the same list for its own keys (while `menu.block` is `true`, the default) whenever the keys it wants change, as when it opens, closes or starts typing, and that replaces what a script set. |
+
+```lua title="scripts/50_keys.lua"
+local F7 = 0x76
+
+on_frame(function()
+  if input.pressed(F7) then
+    log("F7 pressed")
+  end
+end)
+```
+
+## The settings store
+
+`config.get(key, default)` and `config.set(key, value)` keep settings in the engine, outside Lua, so they survive reloads, the external engine attaching and detaching, and restarts.
+
+```lua title="scripts/50_counter.lua"
+local starts = config.get("example.starts", 0) + 1
+config.set("example.starts", starts)
+log("these scripts have loaded", starts, "times")
+```
+
+| Rule | Detail |
+| --- | --- |
+| Values | Booleans, numbers and strings. Integers stay integers and floats stay floats. `config.set(key, nil)` removes the key. |
+| Keys | Any string that is not empty, has no leading or trailing spaces, does not start with `#`, and contains no `=` or line break. `config.set` with a bad key raises an error. Use dotted names such as `example.starts` or `engine.tick_ms`. |
+| File | `ScriptHookVI.cfg` next to the engine, beside `ScriptHookVI.log`. Both engines share it when they run from the same folder. |
+| Saving | At most once a second, only after a change, through a temporary file and a rename. |
+| Outside edits | The file can be edited while an engine runs. Each engine reloads it within about a second, and scripts see the new value on their next `config.get`. |
+| Preview and `--run` | Settings stay in memory and nothing is written; `config.path()` returns `nil`. |
+
+The file holds one setting per line, keys sorted, strings in double quotes with `\"`, `\\`, `\n`, `\r` and `\t` escapes:
+
+```text title="bin/ScriptHookVI.cfg"
+# lines that are not key = value stay at the top of the file
+engine.game_thread = true
+engine.log_file = true
+engine.tick_ms = 16
+example.clock = true
+example.starts = 3
+```
+
+A line that is not a setting is reported in the log once per engine start and kept; a `#` line is kept silently.
+
+The engine itself reads four keys:
+
+| Key | Effect |
+| --- | --- |
+| `engine.tick_ms` | Milliseconds between timer ticks, 1 to 1000. Default 16. |
+| `engine.log_file` | `false` stops `log` from appending to `ScriptHookVI.log`; the line still goes to standard error. |
+| `engine.game_thread` | `false` keeps the injected engine's tick on its timer instead of moving it onto the thread of `frame_update`; see [Ticking inside the process](#ticking-inside-the-process). It is read when the engine would move the tick, once per load of the scripts, and a tick already moved stays there until `hook.untick()`. Default `true`. |
+| `scripts.<file>.enabled` | `false` skips that file from the next reload on. `<file>` is the name `scripthookvi.scripts()` gives, so a file in `user/` is `scripts.user/mod.lua.enabled`. Ignored for a file whose name starts with `0`, a digit and `_`. |
+
+Keys that start with `sig.` hold the offsets that `sig.get` found and are read and written by the prelude; see [Signatures](/memory#signatures). Every other key is read only by the scripts that use it.
+
+## Knowing where a script runs
+
+`game.mode()` returns `internal` (injected), `external` (attached from outside, also with `--run`), `detached` (external engine with no process attached) or `preview`. Check it before calls that need the injected engine. Attached from outside, `game.call` and the callers `game.fn` builds raise a Lua error; `detached` and `preview` have no target process, so they call into the engine's own process. `ScriptHookVI-external --run <file.lua> <process>.exe` runs that one file with the prelude only and loads no scripts folder. `scripthookvi.builds` and `scripthookvi.offsets` start empty, so `game.at` returns `nil` unless a script fills them.
+
+```lua title="scripts/50_mode.lua"
+local mode = game.mode()
+if mode == "internal" then
+  log("injected: game.call works")
+elseif mode == "external" then
+  log("attached from outside:", game.status(), "- memory reads work, game.call does not")
+else
+  log(mode, "- no target process")
+end
+```

@@ -1,0 +1,95 @@
+---
+title: Drawing
+description: Draw rectangles, text, lines, shapes and images with the ui table.
+---
+
+Scripts draw with the `ui` table. The engine collects the drawing commands of one tick and shows them together:
+
+| Mode | Where it draws |
+| --- | --- |
+| Injected | A transparent window over the window of the target process. |
+| External | Its own window, or a transparent window over the window of the target process with `--overlay`. |
+| Preview | Into the picture that `preview.sh` writes. |
+
+Commands last for one tick only. Draw from an `on_frame` callback (or a menu's `side.draw`), so the picture is drawn again every tick.
+
+## Coordinates and colours
+
+- Coordinates are pixels from the top-left corner. `ui.width()` and `ui.height()` give the size of the surface. The menu scales everything by `ui.height() / 1080`, so they look the same at any resolution; do the same.
+- Colours are `0xAARRGGBB` integers. The alpha byte comes first, and `0x00` is fully transparent, so `0xFFFFFF` draws nothing; write `0xFFFFFFFF` for opaque white.
+- Text has three faces: `"regular"` (the default) and `"bold"` are Inter, and `"mono"` is JetBrains Mono. Any other font name gives `"regular"`. Sizes are in pixels; the default is 16.
+
+## Example
+
+```lua title="scripts/50_panel.lua"
+local logo, logo_w = ui.image_load("logo.png")
+if not logo then log("no logo:", logo_w) end
+
+on_frame(function(ms)
+  local s = ui.height() / 1080
+  local function px(v) return math.floor(v * s + 0.5) end
+  local x, y, w, h = px(60), px(300), px(420), px(220)
+
+  ui.rect(x, y, w, h, 0xE0202040, px(12), 0xE0101018)
+  ui.frame(x, y, w, h, 0x80FFFFFF, math.max(1, px(2)), px(12))
+
+  local size = px(28)
+  ui.text(x + w / 2, y + px(16), "Drawing", 0xFFFFFFFF, size, "bold", { align = "center" })
+  ui.line(x + px(20), y + px(60), x + w - px(20), y + px(60), 0x60FFFFFF, math.max(1, px(2)))
+
+  local t = ms / 1000
+  local cx, cy = x + px(80), y + px(120)
+  ui.circle(cx, cy, px(40), 0xFFC2185B)
+  ui.circle(cx + math.cos(t * 3) * px(40), cy + math.sin(t * 3) * px(40), px(8), 0xFFFFFFFF)
+  ui.triangle(x + px(160), y + px(180), x + px(200), y + px(100), x + px(240), y + px(180), 0xFF2E7D32)
+
+  ui.clip(x + px(260), y + px(80), px(140), px(90))
+  ui.rect(x + px(260), y + px(80), px(200), px(200), 0xFF1565C0, 0, 0xFF00796B, "horizontal")
+  ui.clip()
+
+  ui.text(x + w - px(20), y + h - px(40), string.format("%.1f s", t), 0xFFC8C8C8, px(18), nil,
+    { align = "right", tabular = true })
+  if logo then ui.image(logo, x + px(20), y + h - px(48), px(32)) end
+end)
+```
+
+It draws a rounded panel with a vertical gradient and an outline, a centred bold title over a rule, a circle with a dot orbiting it, a triangle, a horizontal gradient cut to a box with `ui.clip`, a right-aligned timer with even-width digits, and `logo.png` from the scripts folder when that file exists.
+
+## Shapes
+
+| Call | Draws |
+| --- | --- |
+| `ui.rect(x, y, w, h, color [, radius, end_color, direction])` | A filled rectangle, with rounded corners of `radius` pixels. With `end_color` it is a gradient from `color` to `end_color`, top to bottom, or left to right when `direction` is `"horizontal"`. |
+| `ui.frame(x, y, w, h, color [, thickness, radius])` | The outline of a rectangle, drawn inside it. Thickness 1 by default. |
+| `ui.line(x1, y1, x2, y2, color [, thickness])` | A line with square ends. The end points are pixel centres, so a 1-pixel line on whole coordinates is sharp. |
+| `ui.circle(cx, cy, r, color)` | A filled, antialiased circle. |
+| `ui.triangle(x1, y1, x2, y2, x3, y3, color)` | A filled, antialiased triangle. |
+| `ui.clip(x, y, w, h)`, `ui.clip()` | Cuts every later command of the tick to the rectangle; with no arguments, removes the cut. |
+
+## Text
+
+| Call | Does |
+| --- | --- |
+| `ui.text(x, y, text [, color, size, font] [, options])` | Draws `text` with its top-left corner at `x, y`. Colour defaults to opaque white; size is clamped to 4 to 200. |
+| `ui.text_width(text [, size, font] [, options])` | The width `text` would take, in pixels. Uses `spacing` and `tabular` from the options. |
+| `ui.line_height([size, font])` | The height of one line of text. |
+
+The options table is always the last argument. It can come straight after any of the optional arguments: `ui.text(x, y, text, color, size, { align = "center" })` uses the regular font. Passing `nil` for the font, as the example does, works too.
+
+| Option | Effect |
+| --- | --- |
+| `align` | `"left"` (default), `"center"` or `"right"`, relative to `x`. |
+| `spacing` | Extra pixels between letters. |
+| `max_width` | Cuts the text with `…` to fit this many pixels. |
+| `tabular` | When `true`, every digit takes the width of the widest one, so changing numbers do not jitter. |
+
+To centre text vertically in a band of height `h`, place it at `top + (h - ui.line_height(size)) / 2`, as the menu does.
+
+## Images
+
+| Call | Does |
+| --- | --- |
+| `ui.image_load(path)` | Loads a PNG, relative to the scripts folder. Returns `id, width, height`, or `nil, message`. Loading the same path again returns the same id. |
+| `ui.image(id, x, y [, w, h, tint])` | Draws a loaded image scaled with bilinear filtering. `h` follows `w` to keep the aspect ratio when left out; `tint` multiplies its colours (`0xAARRGGBB`). An unknown id raises `no image <id>`. |
+
+Load images once at the top of a file, not every tick. The engine keeps loaded images across script reloads and returns the cached copy for a path it has seen, so an edited PNG shows only after the engine restarts (or, in the external engine, after it attaches to or detaches from the process).
